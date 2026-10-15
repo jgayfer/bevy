@@ -3,28 +3,24 @@ use crate::{
 };
 use bevy_asset::AssetId;
 use bevy_camera::visibility::ViewVisibility;
-use bevy_color::LinearRgba;
 use bevy_ecs::{
     entity::Entity,
-    query::Has,
-    system::{Commands, Query, ResMut},
+    system::{Commands, Local, Query, ResMut},
 };
 use bevy_math::{Vec2, Vec3};
 use bevy_render::sync_world::TemporaryRenderEntity;
 use bevy_render::Extract;
 use bevy_sprite::{Anchor, Text2dShadow};
 use bevy_text::{
-    ComputedTextBlock, PositionedGlyph, Strikethrough, StrikethroughColor, TextBackgroundColor,
-    TextBounds, TextColor, TextLayoutInfo, Underline, UnderlineColor,
+    text_quads, ComputedTextBlock, TextBounds, TextLayoutInfo, TextQuad, TextSectionStyle,
 };
 use bevy_transform::prelude::GlobalTransform;
 
-/// This system extracts the sprites from the 2D text components and adds them to the
-/// "render world".
 pub fn extract_text2d_sprite(
     mut commands: Commands,
     mut extracted_sprites: ResMut<ExtractedSprites>,
     mut extracted_slices: ResMut<ExtractedSlices>,
+    mut quads: Local<Vec<TextQuad>>,
     text2d_query: Extract<
         Query<(
             Entity,
@@ -37,278 +33,93 @@ pub fn extract_text2d_sprite(
             &GlobalTransform,
         )>,
     >,
-    text_colors: Extract<Query<&TextColor>>,
-    text_background_colors_query: Extract<Query<&TextBackgroundColor>>,
-    decoration_query: Extract<
-        Query<(
-            &TextColor,
-            Has<Strikethrough>,
-            Has<Underline>,
-            Option<&StrikethroughColor>,
-            Option<&UnderlineColor>,
-        )>,
-    >,
+    styles: Extract<Query<TextSectionStyle>>,
 ) {
     extracted_sprites.sprites.clear();
     extracted_slices.slices.clear();
 
-    let mut start = extracted_slices.slices.len();
-    let mut end = start + 1;
-
-    for (
-        main_entity,
-        view_visibility,
-        computed_block,
-        text_layout_info,
-        text_bounds,
-        anchor,
-        maybe_shadow,
-        global_transform,
-    ) in text2d_query.iter()
+    for (main_entity, view_visibility, block, layout, bounds, anchor, shadow, global_transform) in
+        text2d_query.iter()
     {
         if !view_visibility.get() {
             continue;
         }
 
-        let inverse_scale_factor = text_layout_info.scale_factor.recip();
-        let scaling =
-            GlobalTransform::from_scale(Vec3::new(inverse_scale_factor, -inverse_scale_factor, 1.));
+        let scale_factor = layout.scale_factor;
+        let inverse_scale_factor = scale_factor.recip();
         let size = Vec2::new(
-            text_bounds
-                .width
-                .unwrap_or(text_layout_info.size.x * inverse_scale_factor),
-            text_bounds
+            bounds.width.unwrap_or(layout.size.x * inverse_scale_factor),
+            bounds
                 .height
-                .unwrap_or(text_layout_info.size.y * inverse_scale_factor),
+                .unwrap_or(layout.size.y * inverse_scale_factor),
         );
-
         let top_left = (Anchor::TOP_LEFT.0 - anchor.as_vec()) * size;
 
-        for run in text_layout_info.run_geometry.iter() {
-            let section_entity = computed_block.entities()[run.section_index as usize].entity;
-            let Ok(text_background_color) = text_background_colors_query.get(section_entity) else {
+        // Text space is y-down physical pixels; flip and scale it into the entity's local space.
+        let transform = *global_transform
+            * GlobalTransform::from_translation(top_left.extend(0.))
+            * GlobalTransform::from_scale(Vec3::new(
+                inverse_scale_factor,
+                -inverse_scale_factor,
+                1.,
+            ));
+
+        // `Text2dShadow::offset` is in logical y-up units; convert it into text space.
+        let shadow = shadow.map(|shadow| {
+            (
+                shadow.offset * Vec2::new(scale_factor, -scale_factor),
+                shadow.color.to_linear(),
+            )
+        });
+
+        quads.clear();
+        text_quads(&mut quads, layout, block, &styles, shadow);
+
+        let mut i = 0;
+        while i < quads.len() {
+            let quad = quads[i];
+
+            let Some(texture) = quad.texture else {
+                extracted_sprites.sprites.push(ExtractedSprite {
+                    main_entity,
+                    render_entity: commands.spawn(TemporaryRenderEntity::default()).id(),
+                    transform: transform
+                        * GlobalTransform::from_translation(quad.center.extend(0.)),
+                    color: quad.color,
+                    image_handle_id: AssetId::default(),
+                    flip_y: false,
+                    kind: ExtractedSpriteKind::Single {
+                        custom_size: quad.size,
+                    },
+                });
+                i += 1;
                 continue;
             };
-            let render_entity = commands.spawn(TemporaryRenderEntity::default()).id();
-            let offset = run.bounds.center();
-            let transform = *global_transform
-                * GlobalTransform::from_translation(top_left.extend(0.))
-                * scaling
-                * GlobalTransform::from_translation(offset.extend(0.));
-            extracted_sprites.sprites.push(ExtractedSprite {
-                main_entity,
-                render_entity,
-                transform,
-                color: text_background_color.0.into(),
-                image_handle_id: AssetId::default(),
-                flip_y: true,
-                kind: ExtractedSpriteKind::Single {
-                    custom_size: run.bounds.size(),
-                },
-            });
-        }
 
-        if let Some(shadow) = maybe_shadow {
-            let shadow_transform = *global_transform
-                * GlobalTransform::from_translation((top_left + shadow.offset).extend(0.))
-                * scaling;
-            let color = shadow.color.into();
-
-            for (
-                i,
-                PositionedGlyph {
-                    position,
-                    atlas_info,
-                    ..
-                },
-            ) in text_layout_info.glyphs.iter().enumerate()
+            // A sprite instance has one color and one texture, so batch glyphs on both.
+            let start = extracted_slices.slices.len();
+            while let Some(next) = quads.get(i)
+                && next.texture == Some(texture)
+                && next.color == quad.color
             {
                 extracted_slices.slices.push(ExtractedSlice {
-                    offset: *position,
-                    rect: atlas_info.rect,
-                    size: atlas_info.rect.size(),
+                    offset: next.center,
+                    rect: next.rect,
+                    size: next.size,
                 });
-
-                if text_layout_info
-                    .glyphs
-                    .get(i + 1)
-                    .is_none_or(|info| info.atlas_info.texture != atlas_info.texture)
-                {
-                    let render_entity = commands.spawn(TemporaryRenderEntity::default()).id();
-                    extracted_sprites.sprites.push(ExtractedSprite {
-                        main_entity,
-                        render_entity,
-                        transform: shadow_transform,
-                        color,
-                        image_handle_id: atlas_info.texture,
-                        flip_y: true,
-                        kind: ExtractedSpriteKind::Slices {
-                            indices: start..end,
-                        },
-                    });
-                    start = end;
-                }
-
-                end += 1;
+                i += 1;
             }
-
-            for run in text_layout_info.run_geometry.iter() {
-                let section_entity = computed_block.entities()[run.section_index as usize].entity;
-                let Ok((_, has_strikethrough, has_underline, _, _)) =
-                    decoration_query.get(section_entity)
-                else {
-                    continue;
-                };
-
-                if has_strikethrough {
-                    let render_entity = commands.spawn(TemporaryRenderEntity::default()).id();
-                    let offset = run.strikethrough_position();
-                    let transform =
-                        shadow_transform * GlobalTransform::from_translation(offset.extend(0.));
-                    extracted_sprites.sprites.push(ExtractedSprite {
-                        main_entity,
-                        render_entity,
-                        transform,
-                        color,
-                        image_handle_id: AssetId::default(),
-                        flip_y: false,
-                        kind: ExtractedSpriteKind::Single {
-                            custom_size: run.strikethrough_size(),
-                        },
-                    });
-                }
-
-                if has_underline {
-                    let render_entity = commands.spawn(TemporaryRenderEntity::default()).id();
-                    let offset = run.underline_position();
-                    let transform =
-                        shadow_transform * GlobalTransform::from_translation(offset.extend(0.));
-                    extracted_sprites.sprites.push(ExtractedSprite {
-                        main_entity,
-                        render_entity,
-                        transform,
-                        color,
-                        image_handle_id: AssetId::default(),
-                        flip_y: false,
-                        kind: ExtractedSpriteKind::Single {
-                            custom_size: run.underline_size(),
-                        },
-                    });
-                }
-            }
-        }
-
-        let transform =
-            *global_transform * GlobalTransform::from_translation(top_left.extend(0.)) * scaling;
-        let mut color = LinearRgba::WHITE;
-        let mut current_section = u32::MAX;
-
-        for (
-            i,
-            PositionedGlyph {
-                position,
-                atlas_info,
-                section_index,
-                ..
-            },
-        ) in text_layout_info.glyphs.iter().enumerate()
-        {
-            if *section_index != current_section {
-                color = computed_block
-                    .entities()
-                    .get(*section_index as usize)
-                    .and_then(|t| text_colors.get(t.entity).ok())
-                    .map(|text_color| LinearRgba::from(text_color.0))
-                    .unwrap_or_default();
-                current_section = *section_index;
-            }
-            extracted_slices.slices.push(ExtractedSlice {
-                offset: *position,
-                rect: atlas_info.rect,
-                size: atlas_info.rect.size(),
+            extracted_sprites.sprites.push(ExtractedSprite {
+                main_entity,
+                render_entity: commands.spawn(TemporaryRenderEntity::default()).id(),
+                transform,
+                color: quad.color,
+                image_handle_id: texture,
+                flip_y: true,
+                kind: ExtractedSpriteKind::Slices {
+                    indices: start..extracted_slices.slices.len(),
+                },
             });
-
-            if text_layout_info.glyphs.get(i + 1).is_none_or(|info| {
-                info.section_index != current_section
-                    || info.atlas_info.texture != atlas_info.texture
-            }) {
-                let render_entity = commands.spawn(TemporaryRenderEntity::default()).id();
-                extracted_sprites.sprites.push(ExtractedSprite {
-                    main_entity,
-                    render_entity,
-                    transform,
-                    color,
-                    image_handle_id: atlas_info.texture,
-                    flip_y: true,
-                    kind: ExtractedSpriteKind::Slices {
-                        indices: start..end,
-                    },
-                });
-                start = end;
-            }
-
-            end += 1;
-        }
-
-        for run in text_layout_info.run_geometry.iter() {
-            let section_entity = computed_block.entities()[run.section_index as usize].entity;
-            let Ok((
-                text_color,
-                has_strike_through,
-                has_underline,
-                maybe_strikethrough_color,
-                maybe_underline_color,
-            )) = decoration_query.get(section_entity)
-            else {
-                continue;
-            };
-            if has_strike_through {
-                let color = maybe_strikethrough_color
-                    .map(|c| c.0)
-                    .unwrap_or(text_color.0)
-                    .to_linear();
-                let render_entity = commands.spawn(TemporaryRenderEntity::default()).id();
-                let offset = run.strikethrough_position();
-                let transform = *global_transform
-                    * GlobalTransform::from_translation(top_left.extend(0.))
-                    * scaling
-                    * GlobalTransform::from_translation(offset.extend(0.));
-                extracted_sprites.sprites.push(ExtractedSprite {
-                    main_entity,
-                    render_entity,
-                    transform,
-                    color,
-                    image_handle_id: AssetId::default(),
-                    flip_y: false,
-                    kind: ExtractedSpriteKind::Single {
-                        custom_size: run.strikethrough_size(),
-                    },
-                });
-            }
-
-            if has_underline {
-                let color = maybe_underline_color
-                    .map(|c| c.0)
-                    .unwrap_or(text_color.0)
-                    .to_linear();
-                let render_entity = commands.spawn(TemporaryRenderEntity::default()).id();
-                let offset = run.underline_position();
-                let transform = *global_transform
-                    * GlobalTransform::from_translation(top_left.extend(0.))
-                    * scaling
-                    * GlobalTransform::from_translation(offset.extend(0.));
-                extracted_sprites.sprites.push(ExtractedSprite {
-                    main_entity,
-                    render_entity,
-                    transform,
-                    color,
-                    image_handle_id: AssetId::default(),
-                    flip_y: false,
-                    kind: ExtractedSpriteKind::Single {
-                        custom_size: run.underline_size(),
-                    },
-                });
-            }
         }
     }
 }

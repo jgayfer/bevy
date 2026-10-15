@@ -72,9 +72,9 @@ use gradient::GradientPlugin;
 
 use bevy_platform::collections::{hash_map::Entry, HashMap, HashSet};
 use bevy_text::{
-    ComputedTextBlock, EditableText, InlineBox, PositionedGlyph, Strikethrough, StrikethroughColor,
-    TextBackgroundColor, TextColor, TextCursorStyle, TextLayoutInfo, TextSpan, Underline,
-    UnderlineColor,
+    text_quads, ComputedTextBlock, EditableText, InlineBox, Strikethrough, StrikethroughColor,
+    TextBackgroundColor, TextColor, TextCursorStyle, TextLayoutInfo, TextQuad, TextQuadKind,
+    TextSectionStyle, TextSpan, Underline, UnderlineColor,
 };
 use bevy_transform::components::GlobalTransform;
 use box_shadow::BoxShadowPlugin;
@@ -139,8 +139,6 @@ pub enum RenderUiSystems {
     ExtractTextureSlice,
     ExtractBorders,
     ExtractViewportNodes,
-    ExtractTextBackgrounds,
-    ExtractTextShadows,
     ExtractText,
     ExtractCursor,
     ExtractDebug,
@@ -253,8 +251,6 @@ impl Plugin for UiRenderPlugin {
                     RenderUiSystems::ExtractImages,
                     RenderUiSystems::ExtractTextureSlice,
                     RenderUiSystems::ExtractBorders,
-                    RenderUiSystems::ExtractTextBackgrounds,
-                    RenderUiSystems::ExtractTextShadows,
                     RenderUiSystems::ExtractText,
                     RenderUiSystems::ExtractCursor,
                     RenderUiSystems::ExtractDebug,
@@ -274,9 +270,7 @@ impl Plugin for UiRenderPlugin {
                     extract_uinode_images.in_set(RenderUiSystems::ExtractImages),
                     extract_uinode_borders.in_set(RenderUiSystems::ExtractBorders),
                     extract_viewport_nodes.in_set(RenderUiSystems::ExtractViewportNodes),
-                    extract_text_decorations.in_set(RenderUiSystems::ExtractTextBackgrounds),
-                    extract_text_shadows.in_set(RenderUiSystems::ExtractTextShadows),
-                    extract_text_sections.in_set(RenderUiSystems::ExtractText),
+                    extract_text.in_set(RenderUiSystems::ExtractText),
                     extract_text_cursor.in_set(RenderUiSystems::ExtractCursor),
                     extract_preedit_underlines.in_set(RenderUiSystems::ExtractCursor),
                     extract_inline_images.in_set(RenderUiSystems::ExtractInlineImages),
@@ -695,10 +689,9 @@ pub fn extract_uinode_changes(
         }
 
         // If this node is a `TextSpan`, then we need to invalidate the ancestor
-        // `Text` node too. This is because `extract_text_decorations` only
-        // looks at the `text_background_colors_query` for the text spans if the
-        // `uinode_query` that it's iterating over matched the ancestor `Text`
-        // node.
+        // `Text` node too. This is because `extract_text` only looks at the
+        // span styles if the `uinode_query` that it's iterating over matched
+        // the ancestor `Text` node.
         if let Some(extra_nodes_to_invalidate) = maybe_extra_nodes_to_invalidate
             && let Ok(parent) = text_span_parent_query.get(main_entity.entity())
         {
@@ -1625,9 +1618,10 @@ pub fn extract_viewport_nodes(
     }
 }
 
-pub fn extract_text_sections(
+pub fn extract_text(
     mut commands: Commands,
     extracted_uinodes: ResMut<ExtractedUiNodes>,
+    mut quads: Local<Vec<TextQuad>>,
     uinode_query: Extract<
         Query<(
             Entity,
@@ -1638,13 +1632,13 @@ pub fn extract_text_sections(
             Option<&CalculatedClip>,
             &ComputedUiTargetCamera,
             &ComputedTextBlock,
-            &TextColor,
             &TextLayoutInfo,
+            Option<&TextShadow>,
             Option<&EditableText>,
             Option<&TextCursorStyle>,
         )>,
     >,
-    text_styles: Extract<Query<&TextColor>>,
+    styles: Extract<Query<TextSectionStyle>>,
     camera_map: Extract<UiCameraMap>,
 ) {
     let extracted_uinodes = extracted_uinodes.into_inner();
@@ -1661,8 +1655,8 @@ pub fn extract_text_sections(
         maybe_clip,
         camera,
         computed_block,
-        text_color,
         text_layout_info,
+        shadow,
         editable_text,
         cursor_style,
     ) in extracted_uinodes
@@ -1687,446 +1681,101 @@ pub fn extract_text_sections(
 
         let clip = calculate_text_scroll_clip(editable_text, maybe_clip, uinode, global_transform);
 
-        let mut color = text_color.0.to_linear();
+        // `TextShadow::offset` is in logical pixels; text space is physical pixels.
+        let shadow = shadow.map(|shadow| {
+            (
+                shadow.offset / uinode.inverse_scale_factor(),
+                shadow.color.to_linear(),
+            )
+        });
 
         let selected_text_color = cursor_style
             .and_then(|cursor_style| cursor_style.selected_text_color)
-            .map(|selected_text_color| selected_text_color.to_linear());
+            .map(|color| color.to_linear());
 
-        let mut current_section_index = 0;
+        quads.clear();
+        text_quads(
+            &mut quads,
+            text_layout_info,
+            computed_block,
+            &styles,
+            shadow,
+        );
 
-        for (
-            i,
-            PositionedGlyph {
-                position,
-                atlas_info,
-                section_index,
-                ..
-            },
-        ) in text_layout_info.glyphs.iter().enumerate()
-        {
-            if current_section_index != *section_index
-                && let Some(section_entity) = computed_block
-                    .entities()
-                    .get(*section_index as usize)
-                    .map(|t| t.entity)
-            {
-                color = text_styles
-                    .get(section_entity)
-                    .map(|text_color| LinearRgba::from(text_color.0))
-                    .unwrap_or_default();
-                current_section_index = *section_index;
-            }
+        let mut push = |node: ExtractedUiNode| {
+            extracted_uinodes
+                .uinodes
+                .entry(entity.into())
+                .or_insert_with(|| (extracted_camera_entity, Default::default()))
+                .1
+                .insert(commands.spawn_empty().id(), node);
+        };
 
-            let color = if !atlas_info.is_alpha_mask {
-                LinearRgba::WHITE
-            } else if let Some(selected_text_color) = selected_text_color
+        for (i, quad) in quads.iter().enumerate() {
+            let z_order = stack_index.0 as f32
+                + match quad.kind {
+                    TextQuadKind::Decoration => stack_z_offsets::TEXT_STRIKETHROUGH,
+                    _ => stack_z_offsets::TEXT,
+                };
+
+            let Some(texture) = quad.texture else {
+                push(ExtractedUiNode {
+                    z_order,
+                    clip: clip.clone(),
+                    image: AssetId::default(),
+                    transform: transform * Affine2::from_translation(quad.center),
+                    item: ExtractedUiItem::Node {
+                        color: quad.color,
+                        rect: Rect {
+                            min: Vec2::ZERO,
+                            max: quad.size,
+                        },
+                        atlas_scaling: None,
+                        flip_x: false,
+                        flip_y: false,
+                        border: BorderRect::ZERO,
+                        border_radius: ResolvedBorderRadius::ZERO,
+                        node_type: NodeType::Rect,
+                    },
+                });
+                continue;
+            };
+
+            let mut color = quad.color;
+            if quad.kind == TextQuadKind::Glyph
+                && quad.is_alpha_mask
+                && let Some(selected_text_color) = selected_text_color
                 && text_layout_info
                     .selection_rects
                     .iter()
                     .any(|selection_rect| {
-                        let glyph_rect = Rect::from_center_size(*position, atlas_info.rect.size());
+                        let glyph_rect = Rect::from_center_size(quad.center, quad.size);
                         selection_rect.contains(glyph_rect.min)
                             && selection_rect.contains(glyph_rect.max)
                     })
             {
-                selected_text_color
-            } else {
-                color
-            };
+                color = selected_text_color;
+            }
 
             glyphs.push(ExtractedGlyph {
                 color,
-                translation: *position,
-                rect: atlas_info.rect,
+                translation: quad.center,
+                rect: quad.rect,
             });
 
-            if text_layout_info
-                .glyphs
+            if quads
                 .get(i + 1)
-                .is_none_or(|info| info.atlas_info.texture != atlas_info.texture)
+                .is_none_or(|next| next.texture != Some(texture) || next.kind != quad.kind)
             {
-                extracted_uinodes
-                    .uinodes
-                    .entry(entity.into())
-                    .or_insert_with(|| (extracted_camera_entity, Default::default()))
-                    .1
-                    .insert(
-                        commands.spawn_empty().id(),
-                        ExtractedUiNode {
-                            z_order: stack_index.0 as f32 + stack_z_offsets::TEXT,
-                            image: atlas_info.texture,
-                            clip: clip.clone(),
-                            item: ExtractedUiItem::Glyphs {
-                                glyphs: mem::take(&mut glyphs),
-                            },
-                            transform,
-                        },
-                    );
-            }
-        }
-    }
-}
-
-pub fn extract_text_shadows(
-    mut commands: Commands,
-    extracted_uinodes: ResMut<ExtractedUiNodes>,
-    uinode_query: Extract<
-        Query<(
-            Entity,
-            &ComputedNode,
-            &ComputedStackIndex,
-            &UiGlobalTransform,
-            &ComputedUiTargetCamera,
-            &InheritedVisibility,
-            Option<&CalculatedClip>,
-            &TextLayoutInfo,
-            &TextShadow,
-            &ComputedTextBlock,
-            Option<&EditableText>,
-        )>,
-    >,
-    text_decoration_query: Extract<Query<(Has<Strikethrough>, Has<Underline>)>>,
-    camera_map: Extract<UiCameraMap>,
-) {
-    let extracted_uinodes = extracted_uinodes.into_inner();
-    let mut camera_mapper = camera_map.get_mapper();
-
-    let mut glyphs = vec![];
-
-    for (
-        entity,
-        uinode,
-        stack_index,
-        global_transform,
-        target,
-        inherited_visibility,
-        maybe_clip,
-        text_layout_info,
-        shadow,
-        computed_block,
-        editable_text,
-    ) in extracted_uinodes
-        .changed
-        .iter()
-        .flat_map(|main_entity| uinode_query.get(main_entity.entity()).ok())
-    {
-        // Skip if not visible or if size is set to zero (e.g. when a parent is set to `Display::None`)
-        if !inherited_visibility.get() || uinode.is_empty() {
-            continue;
-        }
-
-        let Some(extracted_camera_entity) = camera_mapper.map(target) else {
-            continue;
-        };
-
-        let node_transform = Affine2::from(*global_transform)
-            * Affine2::from_translation(
-                uinode.content_box().min + shadow.offset / uinode.inverse_scale_factor()
-                    - editable_text.map_or(Vec2::ZERO, |text| text.viewport.offset),
-            );
-
-        let clip = calculate_text_scroll_clip(editable_text, maybe_clip, uinode, global_transform);
-
-        for (
-            i,
-            PositionedGlyph {
-                position,
-                atlas_info,
-                section_index,
-                ..
-            },
-        ) in text_layout_info.glyphs.iter().enumerate()
-        {
-            glyphs.push(ExtractedGlyph {
-                color: shadow.color.into(),
-                translation: *position,
-                rect: atlas_info.rect,
-            });
-
-            if text_layout_info.glyphs.get(i + 1).is_none_or(|info| {
-                info.section_index != *section_index
-                    || info.atlas_info.texture != atlas_info.texture
-            }) {
-                extracted_uinodes
-                    .uinodes
-                    .entry(entity.into())
-                    .or_insert_with(|| (extracted_camera_entity, Default::default()))
-                    .1
-                    .insert(
-                        commands.spawn_empty().id(),
-                        ExtractedUiNode {
-                            transform: node_transform,
-                            z_order: stack_index.0 as f32 + stack_z_offsets::TEXT,
-                            image: atlas_info.texture,
-                            clip: clip.clone(),
-                            item: ExtractedUiItem::Glyphs {
-                                glyphs: mem::take(&mut glyphs),
-                            },
-                        },
-                    );
-            }
-        }
-
-        for run in text_layout_info.run_geometry.iter() {
-            let Some(section_entity) = computed_block
-                .entities()
-                .get(run.section_index as usize)
-                .map(|t| t.entity)
-            else {
-                continue;
-            };
-            let Ok((has_strikethrough, has_underline)) = text_decoration_query.get(section_entity)
-            else {
-                continue;
-            };
-
-            if has_strikethrough {
-                extracted_uinodes
-                    .uinodes
-                    .entry(entity.into())
-                    .or_insert_with(|| (extracted_camera_entity, Default::default()))
-                    .1
-                    .insert(
-                        commands.spawn_empty().id(),
-                        ExtractedUiNode {
-                            z_order: stack_index.0 as f32 + stack_z_offsets::TEXT,
-                            clip: clip.clone(),
-                            image: AssetId::default(),
-                            transform: node_transform
-                                * Affine2::from_translation(run.strikethrough_position()),
-                            item: ExtractedUiItem::Node {
-                                color: shadow.color.into(),
-                                rect: Rect {
-                                    min: Vec2::ZERO,
-                                    max: run.strikethrough_size(),
-                                },
-                                atlas_scaling: None,
-                                flip_x: false,
-                                flip_y: false,
-                                border: BorderRect::ZERO,
-                                border_radius: ResolvedBorderRadius::ZERO,
-                                node_type: NodeType::Rect,
-                            },
-                        },
-                    );
-            }
-
-            if has_underline {
-                extracted_uinodes
-                    .uinodes
-                    .entry(entity.into())
-                    .or_insert_with(|| (extracted_camera_entity, Default::default()))
-                    .1
-                    .insert(
-                        commands.spawn_empty().id(),
-                        ExtractedUiNode {
-                            z_order: stack_index.0 as f32 + stack_z_offsets::TEXT,
-                            clip: clip.clone(),
-                            image: AssetId::default(),
-                            transform: node_transform
-                                * Affine2::from_translation(run.underline_position()),
-                            item: ExtractedUiItem::Node {
-                                color: shadow.color.into(),
-                                rect: Rect {
-                                    min: Vec2::ZERO,
-                                    max: run.underline_size(),
-                                },
-                                atlas_scaling: None,
-                                flip_x: false,
-                                flip_y: false,
-                                border: BorderRect::ZERO,
-                                border_radius: ResolvedBorderRadius::ZERO,
-                                node_type: NodeType::Rect,
-                            },
-                        },
-                    );
-            }
-        }
-    }
-}
-
-pub fn extract_text_decorations(
-    mut commands: Commands,
-    extracted_uinodes: ResMut<ExtractedUiNodes>,
-    uinode_query: Extract<
-        Query<(
-            Entity,
-            &ComputedNode,
-            &ComputedStackIndex,
-            &ComputedTextBlock,
-            &UiGlobalTransform,
-            &InheritedVisibility,
-            Option<&CalculatedClip>,
-            &ComputedUiTargetCamera,
-            &TextLayoutInfo,
-            Option<&EditableText>,
-        )>,
-    >,
-    text_background_colors_query: Extract<
-        Query<(
-            AnyOf<(&TextBackgroundColor, &Strikethrough, &Underline)>,
-            &TextColor,
-            Option<&StrikethroughColor>,
-            Option<&UnderlineColor>,
-        )>,
-    >,
-    camera_map: Extract<UiCameraMap>,
-) {
-    let extracted_uinodes = extracted_uinodes.into_inner();
-    let mut camera_mapper = camera_map.get_mapper();
-
-    for (
-        entity,
-        uinode,
-        stack_index,
-        computed_block,
-        global_transform,
-        inherited_visibility,
-        maybe_clip,
-        camera,
-        text_layout_info,
-        editable_text,
-    ) in extracted_uinodes
-        .changed
-        .iter()
-        .flat_map(|main_entity| uinode_query.get(main_entity.entity()).ok())
-    {
-        // Skip if not visible or if size is set to zero (e.g. when a parent is set to `Display::None`)
-        if !inherited_visibility.get() || uinode.is_empty() {
-            continue;
-        }
-
-        let Some(extracted_camera_entity) = camera_mapper.map(camera) else {
-            continue;
-        };
-
-        let transform = Affine2::from(global_transform)
-            * Affine2::from_translation(
-                uinode.content_box().min
-                    - editable_text.map_or(Vec2::ZERO, |text| text.viewport.offset),
-            );
-
-        let clip = calculate_text_scroll_clip(editable_text, maybe_clip, uinode, global_transform);
-
-        for run in text_layout_info.run_geometry.iter() {
-            let Some(section_entity) = computed_block
-                .entities()
-                .get(run.section_index as usize)
-                .map(|t| t.entity)
-            else {
-                continue;
-            };
-            let Ok((
-                (text_background_color, maybe_strikethrough, maybe_underline),
-                text_color,
-                maybe_strikethrough_color,
-                maybe_underline_color,
-            )) = text_background_colors_query.get(section_entity)
-            else {
-                continue;
-            };
-
-            if let Some(text_background_color) = text_background_color {
-                extracted_uinodes
-                    .uinodes
-                    .entry(entity.into())
-                    .or_insert_with(|| (extracted_camera_entity, Default::default()))
-                    .1
-                    .insert(
-                        commands.spawn_empty().id(),
-                        ExtractedUiNode {
-                            z_order: stack_index.0 as f32 + stack_z_offsets::TEXT,
-                            clip: clip.clone(),
-                            image: AssetId::default(),
-                            transform: transform * Affine2::from_translation(run.bounds.center()),
-                            item: ExtractedUiItem::Node {
-                                color: text_background_color.0.to_linear(),
-                                rect: Rect {
-                                    min: Vec2::ZERO,
-                                    max: run.bounds.size(),
-                                },
-                                atlas_scaling: None,
-                                flip_x: false,
-                                flip_y: false,
-                                border: BorderRect::ZERO,
-                                border_radius: ResolvedBorderRadius::ZERO,
-                                node_type: NodeType::Rect,
-                            },
-                        },
-                    );
-            }
-
-            if maybe_strikethrough.is_some() {
-                let color = maybe_strikethrough_color
-                    .map(|sc| sc.0)
-                    .unwrap_or(text_color.0)
-                    .to_linear();
-
-                extracted_uinodes
-                    .uinodes
-                    .entry(entity.into())
-                    .or_insert_with(|| (extracted_camera_entity, Default::default()))
-                    .1
-                    .insert(
-                        commands.spawn_empty().id(),
-                        ExtractedUiNode {
-                            z_order: stack_index.0 as f32 + stack_z_offsets::TEXT_STRIKETHROUGH,
-                            clip: clip.clone(),
-                            image: AssetId::default(),
-                            transform: transform
-                                * Affine2::from_translation(run.strikethrough_position()),
-                            item: ExtractedUiItem::Node {
-                                color,
-                                rect: Rect {
-                                    min: Vec2::ZERO,
-                                    max: run.strikethrough_size(),
-                                },
-                                atlas_scaling: None,
-                                flip_x: false,
-                                flip_y: false,
-                                border: BorderRect::ZERO,
-                                border_radius: ResolvedBorderRadius::ZERO,
-                                node_type: NodeType::Rect,
-                            },
-                        },
-                    );
-            }
-
-            if maybe_underline.is_some() {
-                let color = maybe_underline_color
-                    .map(|uc| uc.0)
-                    .unwrap_or(text_color.0)
-                    .to_linear();
-
-                extracted_uinodes
-                    .uinodes
-                    .entry(entity.into())
-                    .or_insert_with(|| (extracted_camera_entity, Default::default()))
-                    .1
-                    .insert(
-                        commands.spawn_empty().id(),
-                        ExtractedUiNode {
-                            z_order: stack_index.0 as f32 + stack_z_offsets::TEXT_STRIKETHROUGH,
-                            clip: clip.clone(),
-                            image: AssetId::default(),
-                            transform: transform
-                                * Affine2::from_translation(run.underline_position()),
-                            item: ExtractedUiItem::Node {
-                                color,
-                                rect: Rect {
-                                    min: Vec2::ZERO,
-                                    max: run.underline_size(),
-                                },
-                                atlas_scaling: None,
-                                flip_x: false,
-                                flip_y: false,
-                                border: BorderRect::ZERO,
-                                border_radius: ResolvedBorderRadius::ZERO,
-                                node_type: NodeType::Rect,
-                            },
-                        },
-                    );
+                push(ExtractedUiNode {
+                    z_order,
+                    clip: clip.clone(),
+                    image: texture,
+                    transform,
+                    item: ExtractedUiItem::Glyphs {
+                        glyphs: mem::take(&mut glyphs),
+                    },
+                });
             }
         }
     }
