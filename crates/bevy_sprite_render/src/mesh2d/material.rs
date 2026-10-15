@@ -1,7 +1,7 @@
 use crate::{
-    extract_2d_meshes, init_mesh_2d_pipeline, load_mesh2d_bindings, DrawMesh2d, Mesh2d,
-    Mesh2dPipeline, Mesh2dPipelineKey, RenderMesh2dInstances, SetMesh2dBindGroup,
-    SetMesh2dViewBindGroup, ViewKeyCache,
+    extract_2d_meshes, init_mesh_2d_pipeline, load_mesh2d_bindings, DrawMesh2d, Mesh2dPipeline,
+    Mesh2dPipelineKey, RenderMesh2dInstances, SetMesh2dBindGroup, SetMesh2dViewBindGroup,
+    ViewKeyCache,
 };
 use alloc::sync::Arc;
 use bevy_app::{App, Plugin, PostUpdate};
@@ -29,7 +29,7 @@ use bevy_material::key::{ErasedMaterialKey, ErasedMaterialPipelineKey, ErasedMes
 use bevy_material::labels::{DrawFunctionLabel, InternedShaderLabel, ShaderLabel};
 use bevy_material::{AlphaMode, MaterialProperties, OpaqueRendererMethod, RenderPhaseType};
 use bevy_math::FloatOrd;
-use bevy_mesh::MeshVertexBufferLayoutRef;
+use bevy_mesh::{Mesh2d, MeshVertexBufferLayoutRef};
 use bevy_platform::collections::{HashMap, HashSet};
 use bevy_platform::hash::FixedHasher;
 use bevy_reflect::{prelude::ReflectDefault, Reflect};

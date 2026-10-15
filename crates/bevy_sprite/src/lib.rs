@@ -63,6 +63,10 @@ use bevy_image::{Image, TextureAtlasLayout, TextureAtlasPlugin};
 #[derive(Default)]
 pub struct SpritePlugin;
 
+#[cfg(feature = "bevy_text")]
+#[derive(SystemSet, Debug, Hash, PartialEq, Eq, Clone)]
+pub struct Text2dSystems;
+
 impl Plugin for SpritePlugin {
     fn build(&self, app: &mut App) {
         if !app.is_plugin_added::<TextureAtlasPlugin>() {
@@ -80,6 +84,7 @@ impl Plugin for SpritePlugin {
             PostUpdate,
             (update_text2d_layout.after(bevy_camera::CameraUpdateSystems),)
                 .chain()
+                .in_set(Text2dSystems)
                 .after(detect_text_needs_rerender)
                 .after(bevy_text::load_font_assets_into_font_collection)
                 .after(bevy_text::apply_text_edits)
@@ -90,6 +95,7 @@ impl Plugin for SpritePlugin {
         .add_systems(
             PostUpdate,
             calculate_bounds_text2d
+                .in_set(Text2dSystems)
                 .in_set(VisibilitySystems::CalculateBounds)
                 .after(update_text2d_layout),
         );

@@ -52,7 +52,6 @@ impl Plugin for LineGizmo2dPlugin {
                 Render,
                 GizmoRenderSystems::QueueLineGizmos2d
                     .in_set(RenderSystems::Queue)
-                    .ambiguous_with(bevy_sprite_render::queue_sprites)
                     .ambiguous_with(bevy_sprite_render::queue_material2d_meshes),
             )
             .add_systems(

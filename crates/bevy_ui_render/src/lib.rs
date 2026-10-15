@@ -29,9 +29,9 @@ use bevy_ecs::entity::EntityIndexMap;
 use bevy_reflect::prelude::ReflectDefault;
 use bevy_reflect::Reflect;
 use bevy_render::camera::{extract_cameras, CameraMainPassTextureFormats};
+use bevy_render::render_asset::ExtractedAssets;
 use bevy_render::sync_world::{MainEntityHashMap, MainEntityHashSet};
 use bevy_shader::load_shader_library;
-use bevy_sprite_render::SpriteAssetEvents;
 use bevy_ui::widget::{
     ImageNode, ImageNodeSize, InlineImage, NodeImageMode, Text, TextShadow, ViewportNode,
 };
@@ -42,7 +42,7 @@ use bevy_ui::{
 };
 
 use bevy_app::prelude::*;
-use bevy_asset::{AssetEvent, AssetEventSystems, AssetId, Assets};
+use bevy_asset::{AssetEventSystems, AssetId, Assets};
 use bevy_color::{Alpha, ColorToComponents, LinearRgba, Luminance};
 use bevy_core_pipeline::schedule::{Core2d, Core2dSystems, Core3d, Core3dSystems};
 use bevy_core_pipeline::upscaling::upscaling;
@@ -1933,20 +1933,16 @@ pub fn prepare_uinodes(
     mut image_bind_groups: ResMut<ImageNodeBindGroups>,
     gpu_images: Res<RenderAssets<GpuImage>>,
     mut phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    events: Res<SpriteAssetEvents>,
+    extracted_images: Res<ExtractedAssets<GpuImage>>,
     mut previous_len: Local<usize>,
 ) {
     // If an image has changed, the GpuImage has (probably) changed
-    for event in &events.images {
-        match event {
-            AssetEvent::Added { .. } |
-            AssetEvent::Unused { .. } |
-            // Images don't have dependencies
-            AssetEvent::LoadedWithDependencies { .. } => {}
-            AssetEvent::Modified { id } | AssetEvent::Removed { id } => {
-                image_bind_groups.values.remove(id);
-            }
-        };
+    for id in extracted_images
+        .modified
+        .iter()
+        .chain(&extracted_images.removed)
+    {
+        image_bind_groups.values.remove(id);
     }
 
     if let Some(view_binding) = view_uniforms.uniforms.binding() {

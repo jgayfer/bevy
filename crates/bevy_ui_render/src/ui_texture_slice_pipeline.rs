@@ -15,6 +15,7 @@ use bevy_image::prelude::*;
 use bevy_math::{Affine2, FloatOrd, Rect, Vec2};
 use bevy_mesh::VertexBufferLayout;
 use bevy_platform::collections::HashMap;
+use bevy_render::render_asset::ExtractedAssets;
 use bevy_render::{
     render_asset::RenderAssets,
     render_phase::*,
@@ -27,7 +28,6 @@ use bevy_render::{
 use bevy_render::{sync_world::MainEntity, GpuResourceAppExt, RenderStartup};
 use bevy_shader::Shader;
 use bevy_sprite::{SliceScaleMode, SpriteImageMode, TextureSlicer};
-use bevy_sprite_render::SpriteAssetEvents;
 use bevy_ui::widget::NodeImageMode;
 use bevy_ui::{ComputedStackIndex, VisualBox};
 use bevy_utils::default;
@@ -484,20 +484,16 @@ pub fn prepare_ui_slices(
     mut image_bind_groups: ResMut<UiTextureSliceImageBindGroups>,
     gpu_images: Res<RenderAssets<GpuImage>>,
     mut phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    events: Res<SpriteAssetEvents>,
+    extracted_images: Res<ExtractedAssets<GpuImage>>,
     mut previous_len: Local<usize>,
 ) {
     // If an image has changed, the GpuImage has (probably) changed
-    for event in &events.images {
-        match event {
-            AssetEvent::Added { .. } |
-            AssetEvent::Unused { .. } |
-            // Images don't have dependencies
-            AssetEvent::LoadedWithDependencies { .. } => {}
-            AssetEvent::Modified { id } | AssetEvent::Removed { id } => {
-                image_bind_groups.values.remove(id);
-            }
-        };
+    for id in extracted_images
+        .modified
+        .iter()
+        .chain(&extracted_images.removed)
+    {
+        image_bind_groups.values.remove(id);
     }
 
     if let Some(view_binding) = view_uniforms.uniforms.binding() {

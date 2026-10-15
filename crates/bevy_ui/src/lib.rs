@@ -205,7 +205,7 @@ impl Plugin for UiPlugin {
                     update_ui_roots,
                     sync_taffy_styles_with_nodes,
                     mark_dirty_ui_trees,
-                    ui_layout_system.ambiguous_with(bevy_sprite::update_text2d_layout),
+                    ui_layout_system.ambiguous_with(bevy_sprite::Text2dSystems),
                     update_computed_nodes,
                     update_border_radius,
                 )
@@ -267,7 +267,7 @@ fn build_text_interop(app: &mut App) {
                 // Potential conflict: `Assets<Image>`
                 // Since both systems will only ever insert new [`Image`] assets,
                 // they will never observe each other's effects.
-                .ambiguous_with(bevy_sprite::update_text2d_layout)
+                .ambiguous_with(bevy_sprite::Text2dSystems)
                 // We assume Text is on disjoint UI entities to ImageNode and UiTextureAtlasImage
                 // FIXME: Add an archetype invariant for this https://github.com/bevyengine/bevy/issues/1481.
                 .ambiguous_with(widget::update_image_content_size_system)
@@ -277,8 +277,7 @@ fn build_text_interop(app: &mut App) {
                 .after(bevy_text::load_font_assets_into_font_collection)
                 .before(bevy_asset::AssetEventSystems)
                 // Text2d and bevy_ui text are entirely on separate entities
-                .ambiguous_with(bevy_sprite::update_text2d_layout)
-                .ambiguous_with(bevy_sprite::calculate_bounds_text2d),
+                .ambiguous_with(bevy_sprite::Text2dSystems),
             (
                 widget::update_editable_text_content_size,
                 widget::update_editable_text_styles,
@@ -289,7 +288,7 @@ fn build_text_interop(app: &mut App) {
                 .before(EditableTextSystems)
                 .ambiguous_with(widget::update_image_content_size_system)
                 .ambiguous_with(widget::measure_text_system)
-                .ambiguous_with(bevy_sprite::update_text2d_layout),
+                .ambiguous_with(bevy_sprite::Text2dSystems),
             widget::sync_editable_text_viewports
                 .after(UiSystems::Clipping)
                 .before(EditableTextSystems),
@@ -304,8 +303,7 @@ fn build_text_interop(app: &mut App) {
                 .before(bevy_input_focus::InputFocusSystems::FocusChangeEvents)
                 .before(bevy_asset::AssetEventSystems)
                 .ambiguous_with(widget::text_system)
-                .ambiguous_with(bevy_sprite::update_text2d_layout)
-                .ambiguous_with(bevy_sprite::calculate_bounds_text2d),
+                .ambiguous_with(bevy_sprite::Text2dSystems),
             sync_font_size_to_em_size
                 .in_set(UiSystems::Content)
                 .after(bevy_text::load_font_assets_into_font_collection),
@@ -319,7 +317,7 @@ fn build_text_interop(app: &mut App) {
 
     app.configure_sets(
         PostUpdate,
-        AmbiguousWithUpdateText2dLayout.ambiguous_with(bevy_sprite::update_text2d_layout),
+        AmbiguousWithUpdateText2dLayout.ambiguous_with(bevy_sprite::Text2dSystems),
     );
 
     // We cannot set this up in bevy_text as this would create a circular dependency between bevy_ui and bevy_text

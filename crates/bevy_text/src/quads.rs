@@ -20,7 +20,7 @@ pub enum TextQuadKind {
     Decoration,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TextQuad {
     pub kind: TextQuadKind,
     pub texture: Option<AssetId<Image>>,
